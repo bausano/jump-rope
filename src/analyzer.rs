@@ -4,13 +4,13 @@ use image::GrayImage;
 use rand::{thread_rng, Rng};
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 
 /// This value is streamed from the spawned analyzer thread to update on what
 /// frequency has been identified.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Report {
     pub window: usize,
     pub frame_index: usize,
@@ -29,7 +29,7 @@ pub struct AnalyzerBuilder {
 /// the spawned analyzer thread on new frames. In consistent intervals, the
 /// thread updates the receiver on what frequency it thinks is most prevalent
 /// in the video.
-pub fn analyzer_channel(
+pub fn channel(
     builder: AnalyzerBuilder,
 ) -> (Sender<Arc<GrayImage>>, Receiver<Report>) {
     let AnalyzerBuilder {
@@ -50,8 +50,8 @@ pub fn analyzer_channel(
         frame_height,
     );
 
-    let (frame_sender, frame_recv) = channel::<Arc<_>>();
-    let (frequency_sender, frequency_recv) = channel();
+    let (frame_sender, frame_recv) = mpsc::channel::<Arc<_>>();
+    let (frequency_sender, frequency_recv) = mpsc::channel();
 
     thread::spawn(move || {
         let frames_per_ms = analyzer.frame_rate as f32 / 1000.0;
@@ -229,8 +229,8 @@ impl Analyzer {
         }
     }
 
-    fn frequency_to_bin(&self, f: f32) -> usize {
-        (f * self.window as f32 / self.frame_rate as f32).floor() as usize
+    fn frequency_to_bin(&self, hz: f32) -> usize {
+        (hz * self.window as f32 / self.frame_rate as f32).floor() as usize
     }
 
     fn bin_to_frequency(&self, bin: usize) -> f32 {
