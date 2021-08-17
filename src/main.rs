@@ -11,20 +11,18 @@ use crate::analyzer::AnalyzerBuilder;
 use crate::frame::FrameIter;
 use frequency_tracker::FrequencyTracker;
 use std::sync::Arc;
+use std::thread;
 
 fn main() {
     ffmpeg::init().unwrap();
 
-    let file = "test/assets/sample_1.mp4";
-    let frames = FrameIter::from_file(file).expect("Cannot load video");
-    let frame_rate = frames.frame_rate();
-    println!("FPS: {}", frame_rate);
+    // TODO: don't hard code FPS but get it from camera settings
+    let frequency_tracker = Arc::new(FrequencyTracker::new(30));
 
-    let frequency_tracker = Arc::new(FrequencyTracker::new(frame_rate));
+    let frequency_tracker_clone = Arc::clone(&frequency_tracker);
+    thread::spawn(move || start_video_analysis(frequency_tracker_clone));
 
-    ui::start_on_another_thread(Arc::clone(&frequency_tracker));
-
-    start_video_analysis(frequency_tracker, frames);
+    ui::start(frequency_tracker);
 }
 
 // Starts iterating the video frames with various window sizes and updates the
@@ -32,11 +30,12 @@ fn main() {
 //
 // # Important
 // This method blocks until video stops.
-fn start_video_analysis(
-    frequency_tracker: Arc<FrequencyTracker>,
-    frames: FrameIter,
-) {
+fn start_video_analysis(frequency_tracker: Arc<FrequencyTracker>) {
+    // TODO: camera might not be on this device
+    let file = "/dev/video0";
+    let frames = FrameIter::from_file(file).expect("Cannot load video");
     let frame_rate = frames.frame_rate();
+    println!("FPS: {}", frame_rate);
 
     // The larger the multiplier, the more granular frequency intervals it can
     // find. However, it takes longer to start reporting and it takes longer to

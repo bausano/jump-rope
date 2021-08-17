@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
+bevy = "0.5"
+bevy_prototype_lyon = "0.3"
 ffmpeg-next = "4.4"
 image = "0.23"
 rand = "0.8"

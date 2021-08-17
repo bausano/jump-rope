@@ -70,20 +70,23 @@ pub fn channel(
         //
         // however most cameras have pretty low FPS and the computation we do
         // on average is super cheap
-        let mut frames = frame_recv.iter().enumerate();
-        while let Some((frame_index, frame)) = frames.next() {
+        for (frame_index, frame) in frame_recv.iter().enumerate() {
             // pushes pixel values to relevant oscillators
             analyzer.push_pixel_values_to_oscillators(&frame);
 
             if frame_index % update_frequency_every_nth_frame == 0 {
                 if let Some(f) = analyzer.frequency() {
-                    frequency_sender
+                    if frequency_sender
                         .send(Report {
                             frame_index,
                             frequency: f,
                             window,
                         })
-                        .expect("Channel died");
+                        .is_err()
+                    {
+                        // channel died, video ended
+                        return;
+                    }
                 }
             }
 
