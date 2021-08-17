@@ -1,49 +1,45 @@
 extern crate ffmpeg_next as ffmpeg;
 
 mod frame;
+mod frequency;
 mod oscillator;
 mod prelude;
-mod xd;
 
-use frame::FrameIter;
-use image::GrayImage;
-use rand::{thread_rng, Rng};
-use xd::Xd;
+use crate::frame::FrameIter;
+use crate::frequency::AnalyzerBuilder;
+use std::sync::Arc;
 
 fn main() {
     ffmpeg::init().unwrap();
 
-    let file = "test/assets/sample_1.mp4";
+    let file = "test/assets/sample_2.mp4";
     let frames = FrameIter::from_file(file).expect("Cannot load video");
     let frame_rate = frames.frame_rate();
+    println!("FPS: {}", frame_rate);
 
-    let mut rng = thread_rng();
-    let mut xd = Xd::new(frame_rate, frame_rate.next_power_of_two());
-    let data_size = frames.width() * frames.height();
-    for _ in 0..(data_size / 5) {
-        let pixel_index = rng.gen_range(0..data_size);
-        xd.track_pixel(pixel_index);
-    }
-    let xd_pixels: Vec<_> = xd.tracked_pixels().map(|k| *k).collect();
+    const WINDOW_MULTIPLIERS: &[usize] = &[4, 8, 12];
+    let channels: Vec<_> = WINDOW_MULTIPLIERS
+        .iter()
+        .map(|multiplier| {
+            frequency::analyzer_channel(AnalyzerBuilder {
+                frame_rate,
+                window: frame_rate * *multiplier,
+                frame_height: frames.height(),
+                frame_width: frames.width(),
+            })
+        })
+        .collect();
 
-    for (frame_index, frame) in frames.enumerate() {
-        process_frame(&frame, frame_index, &mut xd, &xd_pixels);
-    }
-}
+    for frame in frames {
+        let frame = Arc::new(frame);
+        channels.iter().for_each(|(frame_sender, _)| {
+            frame_sender.send(Arc::clone(&frame)).expect("Channel dead")
+        });
 
-fn process_frame(
-    frame: &GrayImage,
-    index: usize,
-    xd: &mut Xd,
-    xd_pixels: &[usize],
-) {
-    let pixels = frame.as_raw();
-    for p in xd_pixels {
-        xd.update_pixel(*p, pixels[*p]);
-    }
-
-    if index % 10 == 0 {
-        println!("{} --------------------------", index);
-        xd.frequency();
+        for (_, frequency_recv) in &channels {
+            if let Some(report) = frequency_recv.try_iter().last() {
+                println!("{:?}", report);
+            }
+        }
     }
 }

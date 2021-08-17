@@ -1,18 +1,24 @@
 use rustfft::{num_complex::Complex, Fft};
-use std::{cmp::Ordering, sync::Arc};
+use std::cmp::Ordering;
+use std::f32::consts::PI;
+use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 pub struct Oscillator {
     // Initiated object which can run FFT.
     fft: Arc<dyn Fft<f32>>,
+    // Determines how are values prepared before FFT is ran.
+    window_fn: WindowFn,
     // Holds past samples, that is pixel grayscale values.
     state: Vec<u8>,
 }
 
 impl Oscillator {
-    pub fn new(fft: Arc<dyn Fft<f32>>) -> Self {
+    pub fn new(fft: Arc<dyn Fft<f32>>, window_fn: WindowFn) -> Self {
         Self {
             fft,
             state: Vec::new(),
+            window_fn,
         }
     }
 
@@ -28,21 +34,10 @@ impl Oscillator {
         }
     }
 
-    pub fn frequency(
-        &self,
-        sample_rate: usize,
-        window: usize,
-        scratch_a: &mut [Complex<f32>],
-        scratch_b: &mut [Complex<f32>],
-    ) -> Option<f32> {
-        let bin = self.frequency_bin(window, scratch_a, scratch_b)?;
-
-        Some((bin * sample_rate) as f32 / window as f32)
-    }
-
-    fn frequency_bin(
+    pub fn frequency_bin(
         &self,
         window: usize,
+        relevant_bins: RangeInclusive<usize>,
         scratch_a: &mut [Complex<f32>],
         scratch_b: &mut [Complex<f32>],
     ) -> Option<usize> {
@@ -54,39 +49,140 @@ impl Oscillator {
             return None;
         }
 
-        // set the buffer to the tail of the state with the len of the tail
-        // given by window size
-        for (index, val) in self
+        let get_state_in_window =
+            || self.state.iter().skip(self.state.len() - window);
+
+        let average = (get_state_in_window()
+            .fold(0, |acc, p| acc + *p as usize)
+            / self.state.len()) as u8;
+        let error = (get_state_in_window()
+            .map(|v| v.max(&average) - v.min(&average))
+            .map(|v| v as usize)
+            .sum::<usize>()
+            / self.state.len()) as u8;
+
+        if error > 10 {
+            /*
+            let xd = self.state.iter().enumerate().fold(
+                String::new(),
+                |mut acc, (k, g)| {
+                    acc.push_str(&format!("({},{}),", k, g));
+                    acc
+                },
+            );
+            println!("{}", xd);
+            */
+        } else {
+            return None;
+        }
+
+        // inserts the state of the oscillator into given buffer after applying
+        // window function and alike
+        self.populate_buffer_with_state(window, scratch_a);
+
+        // stores fft bins into first buffer
+        self.fft.process_with_scratch(scratch_a, scratch_b);
+
+        // looks at the greatest peak in the output and returns the index
+        // (frequency bin) and magnitude (converted to grayscale)
+        largest_bin(window, relevant_bins, scratch_a.iter())
+    }
+
+    // Set the buffer to the tail of the state where the len of the tail is
+    // given by window size.
+    fn populate_buffer_with_state(
+        &self,
+        window: usize,
+        scratch_a: &mut [Complex<f32>],
+    ) {
+        for (index, grayness_byte) in self
             .state
             .iter()
             .skip(self.state.len() - window)
             .enumerate()
         {
-            let val = *val as f32; // todo: apply window function
-            scratch_a[index] = Complex::new(val, 0.0);
+            let real = *grayness_byte as f32 * self.window_fn.apply(index);
+            scratch_a[index] = Complex::new(real, 0.0);
         }
+    }
+}
 
-        self.fft.process_with_scratch(scratch_a, scratch_b);
+// Finds the frequency bin with the highest magnitude and returns its index.
+fn largest_bin<'a>(
+    window: usize,
+    relevant_bins: RangeInclusive<usize>,
+    mut bins: impl Iterator<Item = &'a Complex<f32>>,
+) -> Option<usize> {
+    // the average grayscale pixel value is not used
+    let _dc = bins.next();
 
-        let mut iter = scratch_a.iter();
-        let dc = (iter.next().unwrap().norm() / window as f32).floor() as u8;
-        let (k, mag) =
-            iter.map(|c| c.norm()).take(window / 2).enumerate().max_by(
-                |(_, a), (_, b)| {
-                    if a < b {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                },
-            )?;
-        let mag = (mag / (window as f32)).floor() as u8;
-        if mag > 10 {
-            //println!("dc {} mag  {}", dc, mag);
-            Some(k)
-        } else {
-            None
-        }
+    bins.map(|c| c.norm())
+        // because we only use real values for inputs, the FFT duplicates the
+        // bands into second half, therefore we cut it off
+        .take(window / 2)
+        .map(|mag| mag / window as f32)
+        .enumerate()
+        .skip(*relevant_bins.start())
+        .take(relevant_bins.count())
+        .max_by(|(_, a), (_, b)| {
+            if a < b {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        })
+        .filter(|(_, mag)| *mag > 5.0)
+        // we've skipped the dc on zeroth index
+        .map(|(k, _)| k + 1)
+}
+
+/// Precomputed values by which relevant time value is multiplied to avoid
+/// leakage.
+///
+/// https://www.edn.com/windowing-functions-improve-fft-results-part-i
+#[derive(Clone)]
+pub struct WindowFn(Vec<f32>);
+
+impl WindowFn {
+    #[allow(dead_code)]
+    pub fn blackman(window: usize) -> Self {
+        let precomputed = (0..window)
+            .map(|n| {
+                let n = n as f32;
+                let window = window as f32;
+
+                0.42 - 0.5 * ((2.0 * PI * n) / window).cos()
+                    + 0.08 * ((4.0 * PI * n) / window).cos()
+            })
+            .map(|scalar| scalar.clamp(0.0, 1.0))
+            .collect();
+
+        Self(precomputed)
+    }
+
+    #[allow(dead_code)]
+    pub fn sine_lobe(window: usize) -> Self {
+        let precomputed = (0..window)
+            .map(|n| {
+                let n = n as f32;
+                let window = window as f32;
+
+                (PI * n / window).sin()
+            })
+            .collect();
+
+        Self(precomputed)
+    }
+
+    #[allow(dead_code)]
+    pub fn rectangular(window: usize) -> Self {
+        let precomputed = (0..window).map(|_| 1.0).collect();
+
+        Self(precomputed)
+    }
+
+    fn apply(&self, n: usize) -> f32 {
+        self.0[n]
     }
 }
 
@@ -96,9 +192,9 @@ mod tests {
     use rustfft::FftPlanner;
 
     #[test]
-    fn it_finds_frequency() {
+    fn it_finds_frequency_bin() {
         let window = 128;
-        let sample_rate = 30;
+        let relevant_bins = 0..=window;
 
         let state = (0..window)
             .map(|n| {
@@ -111,8 +207,13 @@ mod tests {
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(window);
+        let window_fn = WindowFn::rectangular(window);
 
-        let oscillator = Oscillator { fft, state };
+        let oscillator = Oscillator {
+            fft,
+            window_fn,
+            state,
+        };
 
         let mut scratch_a = Vec::with_capacity(window);
         scratch_a.resize(window, Complex::default());
@@ -121,18 +222,13 @@ mod tests {
         scratch_b.resize(window, Complex::default());
 
         assert_eq!(
-            oscillator.frequency_bin(window, &mut scratch_a, &mut scratch_b),
-            Some(7)
-        );
-
-        assert_eq!(
-            oscillator.frequency(
-                sample_rate,
+            oscillator.frequency_bin(
                 window,
+                relevant_bins.clone(),
                 &mut scratch_a,
                 &mut scratch_b
             ),
-            Some(1.640625)
+            Some(7)
         );
     }
 }
