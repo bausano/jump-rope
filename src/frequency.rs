@@ -8,20 +8,27 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 
+/// This value is streamed from the spawned analyzer thread to update on what
+/// frequency has been identified.
 #[derive(Debug)]
 pub struct Report {
-    window: usize,
-    frame_index: usize,
-    frequency: f32,
+    pub window: usize,
+    pub frame_index: usize,
+    pub frequency: f32,
 }
 
 pub struct AnalyzerBuilder {
     pub frame_rate: usize,
+    /// How many past values to analyze in FFT.
     pub window: usize,
     pub frame_width: u32,
     pub frame_height: u32,
 }
 
+/// Spawns a new thread based on the settings given. The returned sender updates
+/// the spawned analyzer thread on new frames. In consistent intervals, the
+/// thread updates the receiver on what frequency it thinks is most prevalent
+/// in the video.
 pub fn analyzer_channel(
     builder: AnalyzerBuilder,
 ) -> (Sender<Arc<GrayImage>>, Receiver<Report>) {
@@ -48,11 +55,21 @@ pub fn analyzer_channel(
 
     thread::spawn(move || {
         let frames_per_ms = analyzer.frame_rate as f32 / 1000.0;
+
         let update_frequency_every_nth_frame =
-            (UPDATE_FREQUENCY_AFTER_MS as f32 * frames_per_ms) as usize;
+            (REPORT_FREQUENCY_AFTER_MS as f32 * frames_per_ms) as usize;
         let truncate_state_every_nth_frame =
             (TRUNCATE_STATE_AFTER_MS as f32 * frames_per_ms) as usize;
 
+        // with these iterator we make a fundamental but justified assumption
+        // that it on average takes longer time to deliver new messages than
+        // to process them
+        //
+        // if new frames are produced faster than this loop can process them,
+        // then delay between real time and output keeps widening
+        //
+        // however most cameras have pretty low FPS and the computation we do
+        // on average is super cheap
         let mut frames = frame_recv.iter().enumerate();
         while let Some((frame_index, frame)) = frames.next() {
             // pushes pixel values to relevant oscillators
@@ -79,6 +96,11 @@ pub fn analyzer_channel(
     (frame_sender, frequency_recv)
 }
 
+// Keeps bunch of oscillators that keep track of video state history and return
+// frequencies in that state (each oscillator sees [`VIEW_SIZE`] pixels).
+//
+// The [`Analyzer`] can then put together estimates from each oscillator and
+// average it to get the final frequency.
 struct Analyzer {
     // Initiated object which can run FFT.
     fft: Arc<dyn Fft<f32>>,
@@ -116,6 +138,8 @@ impl Analyzer {
         }
     }
 
+    // Creates `oscillators_count` randomly placed (on a frame) oscillators
+    // which will track average values of some small frame square.
     fn init_oscillators(
         &mut self,
         rng: &mut impl Rng,
@@ -138,6 +162,8 @@ impl Analyzer {
 
         for ((x, y), oscillator) in &mut self.oscillators {
             let (x, y) = (*x, *y);
+            // IMPORTANT: keep VIEW_SIZE the same as additions count here
+            // TODO: change the square size with change in VIEW_SIZE
             let val = ((p(x, y) + p(x, y + 1) + p(x + 1, y) + p(x + 1, y + 1))
                 / VIEW_SIZE) as u8;
             oscillator.push_pixel_value(val);
@@ -145,26 +171,32 @@ impl Analyzer {
     }
 
     fn frequency(&mut self) -> Option<f32> {
-        // Allows us to focus on frequencies in which people usually jump (not too
-        // slow, not too fast).
-        let relevant_bins =
-            self.frequency_to_bin(0.8)..=self.frequency_to_bin(4.0);
+        // Allows us to focus on frequencies in which people usually jump (not
+        // too slow, not too fast).
+        //
+        // If this software were to extend to other domains, the frequencies of
+        // interest would have to be adjusted.
+        let relevant_bins = self.frequency_to_bin(LOWEST_FREQUENCY_OF_INTEREST)
+            ..=self.frequency_to_bin(HIGHEST_FREQUENCY_OF_INTEREST);
+
+        // to prevent reinitializing memory, we keep these buffers
         let (ref mut a, ref mut b) = &mut self.scratch_buffers;
 
+        // index = bin
+        // value = how many oscillators resonate in the bin frequency interval
         let mut bins_count: Vec<usize> = vec![];
         bins_count.resize(self.window / 2, 0);
 
         for oscillator in self.oscillators.values() {
-            if let Some(bin) = oscillator.frequency_bin(
-                self.window,
-                relevant_bins.clone(),
-                a,
-                b,
-            ) {
+            if let Some(bin) =
+                oscillator.frequency_bin(relevant_bins.clone(), a, b)
+            {
                 bins_count[bin] += 1;
             }
         }
 
+        // find the couple of adjacent frequencies which together have the
+        // highest resonating oscillators
         let (bin1, largest_couple) = bins_count
             .windows(2)
             .enumerate()
@@ -193,7 +225,7 @@ impl Analyzer {
 
     fn truncate_state(&mut self) {
         for oscillator in self.oscillators.values_mut() {
-            oscillator.truncate_state(self.window);
+            oscillator.truncate_state();
         }
     }
 

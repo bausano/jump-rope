@@ -1,9 +1,17 @@
+use crate::prelude::*;
 use rustfft::{num_complex::Complex, Fft};
 use std::cmp::Ordering;
 use std::f32::consts::PI;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
+/// Keeps track of oscillation in byte input. In another words, tracks recent
+/// pixel grayscale values and runs FFT against them to get strongest frequency.
+///
+/// # Note
+/// In reality tracks a square of [`VIEW_SIZE`]^2 pixels, because the values
+/// pushed from [`Analyzer`] are average of that square. But that is opaque to
+/// this module.
 pub struct Oscillator {
     // Initiated object which can run FFT.
     fft: Arc<dyn Fft<f32>>,
@@ -11,22 +19,67 @@ pub struct Oscillator {
     window_fn: WindowFn,
     // Holds past samples, that is pixel grayscale values.
     state: Vec<u8>,
+    // Average state value is computed into this field and used to find variance
+    // in pixel value oscillation.
+    //
+    // # Important
+    // This value is meaningless until state length equal at least window.
+    average: f32,
+    // How much are values of this pixel jumping around from average. Low
+    // variance tends to be noise.
+    //
+    // # Important
+    // This value is meaningless until state length equal at least window.
+    variance: f32,
 }
 
 impl Oscillator {
     pub fn new(fft: Arc<dyn Fft<f32>>, window_fn: WindowFn) -> Self {
         Self {
             fft,
-            state: Vec::new(),
+            state: Vec::with_capacity(window_fn.size()),
             window_fn,
+            // meaningless unless at least "window" values are pushed
+            average: 0.0,
+            // meaningless unless at least "window" values are pushed
+            variance: 0.0,
         }
     }
 
     pub fn push_pixel_value(&mut self, value: u8) {
         self.state.push(value);
+
+        // we keep average to calculate variance and variance to eliminate noise
+        let window = self.window() as f32;
+        match self.state.len().cmp(&self.window_fn.size()) {
+            Ordering::Less => (),
+            Ordering::Equal => {
+                let average =
+                    self.state.iter().map(|v| *v as f32).sum::<f32>() / window;
+                let variance = self
+                    .state
+                    .iter()
+                    .fold(0.0f32, |acc, v| acc + (*v as f32 - average).abs())
+                    .abs()
+                    / window;
+                self.average = average;
+                self.variance = variance;
+            }
+            Ordering::Greater => {
+                let window = self.window() as f32;
+                let gray = value as f32;
+                let update_fraction = (window - 1.0) / window;
+                // a' = g / w + a * (w - 1) / w
+                self.average = gray / window + self.average * update_fraction;
+                // v' = |a' - g| / w + v * (w - 1) / w
+                self.variance = (self.average - gray).abs() / window
+                    + self.variance * update_fraction;
+            }
+        }
     }
 
-    pub fn truncate_state(&mut self, window: usize) {
+    pub fn truncate_state(&mut self) {
+        let window = self.window();
         let len = self.state.len();
         if len > window {
             self.state.copy_within((len - window - 1).., 0);
@@ -36,11 +89,12 @@ impl Oscillator {
 
     pub fn frequency_bin(
         &self,
-        window: usize,
         relevant_bins: RangeInclusive<usize>,
         scratch_a: &mut [Complex<f32>],
         scratch_b: &mut [Complex<f32>],
     ) -> Option<usize> {
+        let window = self.window();
+
         debug_assert_eq!(scratch_a.len(), window);
         debug_assert_eq!(scratch_b.len(), window);
 
@@ -49,36 +103,15 @@ impl Oscillator {
             return None;
         }
 
-        let get_state_in_window =
-            || self.state.iter().skip(self.state.len() - window);
-
-        let average = (get_state_in_window()
-            .fold(0, |acc, p| acc + *p as usize)
-            / self.state.len()) as u8;
-        let error = (get_state_in_window()
-            .map(|v| v.max(&average) - v.min(&average))
-            .map(|v| v as usize)
-            .sum::<usize>()
-            / self.state.len()) as u8;
-
-        if error > 10 {
-            /*
-            let xd = self.state.iter().enumerate().fold(
-                String::new(),
-                |mut acc, (k, g)| {
-                    acc.push_str(&format!("({},{}),", k, g));
-                    acc
-                },
-            );
-            println!("{}", xd);
-            */
-        } else {
+        // The values don't oscillate between distinct enough values. Lot of
+        // image noise causes slight changes of brightness. This filters it out.
+        if self.variance < 10.0 {
             return None;
         }
 
         // inserts the state of the oscillator into given buffer after applying
         // window function and alike
-        self.populate_buffer_with_state(window, scratch_a);
+        self.populate_buffer_with_state(scratch_a);
 
         // stores fft bins into first buffer
         self.fft.process_with_scratch(scratch_a, scratch_b);
@@ -90,20 +123,20 @@ impl Oscillator {
 
     // Set the buffer to the tail of the state where the len of the tail is
     // given by window size.
-    fn populate_buffer_with_state(
-        &self,
-        window: usize,
-        scratch_a: &mut [Complex<f32>],
-    ) {
+    fn populate_buffer_with_state(&self, scratch_a: &mut [Complex<f32>]) {
         for (index, grayness_byte) in self
             .state
             .iter()
-            .skip(self.state.len() - window)
+            .skip(self.state.len() - self.window())
             .enumerate()
         {
             let real = *grayness_byte as f32 * self.window_fn.apply(index);
             scratch_a[index] = Complex::new(real, 0.0);
         }
+    }
+
+    fn window(&self) -> usize {
+        self.window_fn.size()
     }
 }
 
@@ -122,6 +155,7 @@ fn largest_bin<'a>(
         .take(window / 2)
         .map(|mag| mag / window as f32)
         .enumerate()
+        // clamps too low and too high frequencies
         .skip(*relevant_bins.start())
         .take(relevant_bins.count())
         .max_by(|(_, a), (_, b)| {
@@ -131,7 +165,8 @@ fn largest_bin<'a>(
                 Ordering::Greater
             }
         })
-        .filter(|(_, mag)| *mag > 5.0)
+        // get rid of data which only poorly aligns
+        .filter(|(_, mag)| *mag > MAGNITUDE_THRESHOLD)
         // we've skipped the dc on zeroth index
         .map(|(k, _)| k + 1)
 }
@@ -181,6 +216,10 @@ impl WindowFn {
         Self(precomputed)
     }
 
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+
     fn apply(&self, n: usize) -> f32 {
         self.0[n]
     }
@@ -196,24 +235,23 @@ mod tests {
         let window = 128;
         let relevant_bins = 0..=window;
 
-        let state = (0..window)
-            .map(|n| {
-                let n = n as f32;
-                let real = 255.0 / 8.0 * ((n - 32.0) / 2.5).cos() + 64.0;
-
-                real.round() as u8
-            })
-            .collect();
-
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(window);
         let window_fn = WindowFn::rectangular(window);
 
-        let oscillator = Oscillator {
-            fft,
-            window_fn,
-            state,
-        };
+        let mut oscillator = Oscillator::new(fft, window_fn);
+
+        // generates some sample input
+        let state = (0..window).map(|n| {
+            let n = n as f32;
+            let real = 255.0 / 8.0 * ((n - 32.0) / 2.5).cos() + 64.0;
+
+            real.round() as u8
+        });
+        for v in state {
+            println!("{}", v);
+            oscillator.push_pixel_value(v);
+        }
 
         let mut scratch_a = Vec::with_capacity(window);
         scratch_a.resize(window, Complex::default());
@@ -223,12 +261,11 @@ mod tests {
 
         assert_eq!(
             oscillator.frequency_bin(
-                window,
                 relevant_bins.clone(),
                 &mut scratch_a,
                 &mut scratch_b
             ),
-            Some(7)
+            Some(8)
         );
     }
 }
