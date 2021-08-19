@@ -2023,6 +2023,7 @@ dependencies = [
  "bevy_prototype_lyon",
  "ffmpeg-next",
  "image",
+ "lyon_tessellation",
  "rand",
  "rustfft",
 ]

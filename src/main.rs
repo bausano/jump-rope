@@ -17,7 +17,7 @@ fn main() {
     ffmpeg::init().unwrap();
 
     // TODO: don't hard code FPS but get it from camera settings
-    let frequency_tracker = Arc::new(FrequencyTracker::new(30));
+    let frequency_tracker = Arc::new(FrequencyTracker::new(10));
 
     let frequency_tracker_clone = Arc::clone(&frequency_tracker);
     thread::spawn(move || start_video_analysis(frequency_tracker_clone));
@@ -62,6 +62,7 @@ fn start_video_analysis(frequency_tracker: Arc<FrequencyTracker>) {
             frame_sender.send(Arc::clone(&frame)).expect("Channel dead")
         });
 
+        // TODO: if no update for long time, clean tracker
         // check for frequency updates
         for (_, frequency_recv) in &channels {
             // we only care about the freshest value

@@ -34,17 +34,22 @@ impl FrequencyTracker {
         //  window size)
         // - in loop take more granular estimates as long as within range of
         //  the previous estimate (go up in window size)
+        //
+        //  TODO: should we care about frame index being up to date?
         frequencies_ordered_by_window_size
             .windows(2)
             .take_while(|pair| {
                 let prev = &pair[0];
                 let curr = &pair[1];
 
-                // half of sensitivity of a single bin in given window size
-                let s = self.frame_rate as f32 / prev.window as f32 / 2.0;
+                // of sensitivity of a single bin in given window size
+                let s = self.frame_rate as f32 / prev.window as f32;
 
                 // all frequencies in this interval are sort of equivalent for
                 // the sensitivity under given window size
+                //
+                // we don't use half bin width to one side and half to the
+                // other purely to give more leeway to the output
                 let interval = (prev.frequency - s)..(prev.frequency + s);
 
                 // if the current report frequency is within the interval,
@@ -52,6 +57,6 @@ impl FrequencyTracker {
                 interval.contains(&curr.frequency)
             })
             .last()
-            .map(|report| report[1].frequency)
+            .map(|report| dbg!(&report[1]).frequency)
     }
 }
