@@ -1,3 +1,5 @@
+//! TODO: This module is yet to be cleaned up as it's still WIP.
+
 use crate::frequency_tracker::FrequencyTracker;
 use crate::prelude::*;
 use bevy::{prelude::*, render::camera::Camera};
