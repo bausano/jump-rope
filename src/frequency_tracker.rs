@@ -57,6 +57,6 @@ impl FrequencyTracker {
                 interval.contains(&curr.frequency)
             })
             .last()
-            .map(|report| dbg!(&report[1]).frequency)
+            .map(|report| report[1].frequency)
     }
 }
